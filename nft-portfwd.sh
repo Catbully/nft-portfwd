@@ -72,7 +72,11 @@ snat_state() {
   # 和 parse_conf 一样先剥注释再匹配：`snat off  # 说明` 加载的是 off，
   # 菜单若显示 on，就会出现"连上了但没响应"的经典现场。
   local v
-  v="$(awk '{ sub(/#.*/, "") } $1 == "snat" && ($2 == "on" || $2 == "off") { v = $2 } END { print v }' "$CONF" 2>/dev/null)"
+  # \r 也要去掉：CRLF 清单里 $2 会是 "off\r"，否则菜单显示 on 而实际加载的是 off。
+  # NF==2 与 parse_conf 的锚定保持一致，`snat off extra` 这种两边都不认。
+  v="$(awk '{ gsub(/\r/, ""); sub(/#.*/, "") }
+             $1 == "snat" && NF == 2 && ($2 == "on" || $2 == "off") { v = $2 }
+             END { print v }' "$CONF" 2>/dev/null)"
   printf '%s' "${v:-on}"
 }
 
@@ -322,7 +326,7 @@ validate_ruleset() {
 
 apply_rules() {
   TMP="$(mktemp)" || die "mktemp 失败"
-  trap 'rm -f "$TMP"' EXIT
+  trap 'rm -f "$TMP" "$TMP.chk" "$TMP.err"' EXIT
 
   parse_conf
   build_ruleset
@@ -513,7 +517,10 @@ do_toggle_snat() {
     *) return ;;
   esac
 
-  grep -vE '^[[:space:]]*snat[[:space:]]+(on|off)[[:space:]]*$' "$CONF" > "$TMPD/c" || true
+  # 用"剥掉注释再判断、但输出原行"的方式过滤：既清掉带行尾注释的旧指令，
+  # 又不会把文件里其它注释一起删掉
+  awk '{ c=$0; sub(/#.*/,"",c); gsub(/^[ \t]+|[ \t]+$/,"",c);
+         if (c ~ /^snat[ \t]+(on|off)$/) next; print }' "$CONF" > "$TMPD/c"
   printf 'snat %s\n' "$new" >> "$TMPD/c"
   echo "源地址伪装 -> $new"
   install_candidate "$TMPD/c" && offer_apply
