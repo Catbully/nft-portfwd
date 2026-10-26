@@ -1,42 +1,13 @@
 #!/usr/bin/env bash
-# =============================================================================
 # nft-portfwd.sh — nftables 端口放行 + 单跳端口转发（DNAT），带交互式菜单
-# =============================================================================
 #
-# 一个文件搞定：菜单、规则解析、校验、落地、开机持久化。规则写在同目录的
-# ports.conf 里（可用 --conf 指定）。
+# 规则写在同目录的 ports.conf（--conf 可指定），用法见 ./nft-portfwd.sh --help。
+# 只做 IPv4 单跳转发：不支持 IPv6 转发、hairpin、应用层中继。
 #
-# 用法：
-#   sudo ./nft-portfwd.sh                 # 交互式菜单（有终端时）
-#   sudo ./nft-portfwd.sh --apply         # 直接应用规则清单
-#   sudo ./nft-portfwd.sh --dry-run       # 只打印生成的 ruleset，不落地
-#   sudo ./nft-portfwd.sh --flush         # 回滚：删表 + 卸开机服务
-#   sudo ./nft-portfwd.sh --persist       # 应用 + 装 systemd 服务（开机自动恢复）
-#   sudo ./nft-portfwd.sh --unpersist     # 只卸开机服务，规则留在内存里
-#   sudo ./nft-portfwd.sh --snat          # 强制开启源地址伪装
-#   sudo ./nft-portfwd.sh --no-snat       # 强制关闭源地址伪装
-#   sudo ./nft-portfwd.sh --conf FILE     # 指定规则清单
-#
-# 三条不可动摇的设计约束（对应 docs/adr/ 里的三份记录）：
-#
-#   1. 只创建并独占一张表 `inet portfwd`。表名不能叫 `fwd`——那是 nft 的保留字，
-#      会得到 "unexpected fwd, expecting string"，整份 ruleset 加载失败。
-#      不碰 /etc/nftables.conf，不碰 iptables-nft 生成的 Docker 表。
-#      回滚永远是一条 `nft delete table inet portfwd`。
-#
-#   2. 转发默认开源地址伪装（masquerade）。DNAT 只改去程：不开伪装时，落地目标的
-#      回包会按自己的路由直接发给客户端、绕过本机，客户端因为源地址对不上自己的
-#      连接而丢弃，表现为"连上了但永远没响应"。实测计数器涨了包、curl 超时。
-#      只有落地目标的回程本来就经过本机时，才用 --no-snat 换取真实源 IP。
-#
-#   3. 开机持久化用独立的 systemd oneshot 单元，不用 /etc/nftables.d/ 片段。
-#      片段在 nftables.service 被禁用的主机上会被静默忽略；而单元里只能写
-#      `After=nftables.service`，绝不能写 `Wants=`——后者会把对方拉起来，若它的
-#      主配置首行是 `flush ruleset`，Docker 的 iptables-nft 表会被一次性清空。
-#
-# 只做 IPv4 单跳转发。不支持：IPv6 转发、hairpin（本机进程访问自己的转发端口）、
-# 应用层中继（按域名/SNI 分流、多目标负载）。
-# =============================================================================
+# 三条约束的原因在 docs/adr/，这里只留结论：
+#   1. 只碰自己那张 `inet portfwd` 表（`fwd` 是 nft 保留字，不能做表名）
+#   2. 转发默认开 masquerade，否则回程绕过本机、表现为"连上但没响应"
+#   3. 持久化用独立 systemd 单元，只写 After=、绝不写 Wants=nftables.service
 
 # 刻意不用 set -e：菜单是交互循环，某次操作失败不该把整个程序带走。
 # 关键步骤（nft 加载、sysctl、mktemp）逐个显式检查。
@@ -98,14 +69,11 @@ rule_count() { active_lines | wc -l | tr -d ' '; }
 
 # 当前伪装状态：清单里有 snat 指令就以它为准，否则默认 on。
 snat_state() {
+  # 和 parse_conf 一样先剥注释再匹配：`snat off  # 说明` 加载的是 off，
+  # 菜单若显示 on，就会出现"连上了但没响应"的经典现场。
   local v
-  # 必须和 parse_conf 一样先剥掉注释再匹配：清单里写 `snat off  # 说明` 时，
-  # 加载用的是 off，菜单却会显示 on —— 那正是"连上了但没响应"的经典现场。
-  v="$(sed 's/#.*//' "$CONF" 2>/dev/null \
-       | grep -E '^[[:space:]]*snat[[:space:]]+(on|off)[[:space:]]*$' \
-       | tail -1 | awk '{print $2}')"
-  [ -n "$v" ] || v="on"
-  printf '%s' "$v"
+  v="$(awk '{ sub(/#.*/, "") } $1 == "snat" && ($2 == "on" || $2 == "off") { v = $2 } END { print v }' "$CONF" 2>/dev/null)"
+  printf '%s' "${v:-on}"
 }
 
 table_loaded() { "$NFT" list table "$FAMILY" "$TABLE" >/dev/null 2>&1; }
@@ -184,7 +152,7 @@ port_ok() {   # 端口必须是 1..65535
   local p="$1"
   # 不允许前导 0：[ -ge ] 是算术比较，080 会被当成八进制而报错，0100 会被当成 64
   [[ "$p" =~ ^[1-9][0-9]{0,4}$ ]] || return 1
-  [ "$p" -ge 1 ] && [ "$p" -le 65535 ]
+  [ "$p" -le 65535 ]
 }
 
 resolve_v4() {   # 主机名 -> IPv4 字面量；解析不到返回空
@@ -198,7 +166,7 @@ resolve_v4() {   # 主机名 -> IPv4 字面量；解析不到返回空
 parse_conf() {
   [ -f "$CONF" ] || die "规则清单不存在: $CONF"
 
-  local lineno=0 raw line ports proto plist p parts joined lport thost tport ip key
+  local lineno=0 raw line ports proto p parts joined lport thost tport ip key
   while IFS= read -r raw || [ -n "$raw" ]; do
     lineno=$((lineno + 1))
 
@@ -216,21 +184,19 @@ parse_conf() {
     # --- 形式一：allow <port[,port...]> [tcp|udp] ---
     if [[ "$line" =~ ^allow[[:space:]]+([0-9]+(,[0-9]+)*)([[:space:]]+(tcp|udp))?$ ]]; then
       ports="${BASH_REMATCH[1]}"
-      proto="${BASH_REMATCH[3]:-}"
-      plist=()
+      # 协议在第 4 组：第 2 组是 (,端口) 的重复，第 3 组带前导空格
+      proto="${BASH_REMATCH[4]:-}"
       IFS=',' read -ra parts <<< "$ports"
       for p in "${parts[@]}"; do
         port_ok "$p" || die "第 $lineno 行: 端口非法 '$p'"
-        plist+=("$p")
       done
-      [ "${#plist[@]}" -gt 0 ] || die "第 $lineno 行: allow 没有端口"
-      joined="$(IFS=','; echo "${plist[*]}" | sed 's/,/, /g')"
+      joined="$(IFS=','; echo "${parts[*]}" | sed 's/,/, /g')"
       if [ -n "$proto" ]; then
-        ALLOW_LINES+=("    $proto dport { $joined } accept")
+        ALLOW_LINES+=("$proto dport { $joined } accept")
       else
         # 省略协议 = 两个都放行
-        ALLOW_LINES+=("    tcp dport { $joined } accept")
-        ALLOW_LINES+=("    udp dport { $joined } accept")
+        ALLOW_LINES+=("tcp dport { $joined } accept")
+        ALLOW_LINES+=("udp dport { $joined } accept")
       fi
       continue
     fi
@@ -257,7 +223,7 @@ parse_conf() {
 
       # iifname != "lo"：只对真正的外部入站做 DNAT，不劫持本机进程访问自己的端口
       # counter：留一个命中计数，"包没到"和"包到了但回程丢"能一眼区分
-      FWD_LINES+=("    iifname != \"lo\" $proto dport $lport counter dnat ip to $ip:$tport")
+      FWD_LINES+=("iifname != \"lo\" $proto dport $lport counter dnat ip to $ip:$tport")
       TARGETS+=("$ip")
       continue
     fi
@@ -281,12 +247,12 @@ build_ruleset() {   # 生成到 $TMP，失败返回非零
     [ "$CONF_SNAT" = "on" ] && do_snat=1 || do_snat=0
   fi
 
-  local snat_lines=() uniq_targets
+  local snat_rule="" uniq_targets
   if [ "$do_snat" -eq 1 ] && [ "${#TARGETS[@]}" -gt 0 ]; then
     uniq_targets="$(printf '%s\n' "${TARGETS[@]}" | sort -u | paste -sd, - | sed 's/,/, /g')"
     # 只对落地目标做伪装。用 `ct status dnat masquerade` 会连带伪装掉同机上
     # Docker 之类的其它 DNAT，属于越界。
-    snat_lines+=("    ip daddr { $uniq_targets } masquerade")
+    snat_rule="ip daddr { $uniq_targets } masquerade"
   fi
 
   {
@@ -295,7 +261,7 @@ build_ruleset() {   # 生成到 $TMP，失败返回非零
     echo "  chain input {"
     echo "    type filter hook input priority filter; policy accept;"
     if [ "${#ALLOW_LINES[@]}" -gt 0 ]; then
-      printf '%s\n' "${ALLOW_LINES[@]}"
+      printf '    %s\n' "${ALLOW_LINES[@]}"
     fi
     echo "  }"
     # prerouting：没有转发规则就不生成 nat 链，避免挂一条空链
@@ -303,7 +269,7 @@ build_ruleset() {   # 生成到 $TMP，失败返回非零
       echo ""
       echo "  chain prerouting {"
       echo "    type nat hook prerouting priority dstnat; policy accept;"
-      printf '%s\n' "${FWD_LINES[@]}"
+      printf '    %s\n' "${FWD_LINES[@]}"
       echo "  }"
     fi
     # forward：policy accept，只做放行。写成 drop 会与 Docker 的 FORWARD drop
@@ -313,11 +279,11 @@ build_ruleset() {   # 生成到 $TMP，失败返回非零
     echo "    ct status dnat accept"
     echo "    ct state established,related accept"
     echo "  }"
-    if [ "${#snat_lines[@]}" -gt 0 ]; then
+    if [ -n "$snat_rule" ]; then
       echo ""
       echo "  chain postrouting {"
       echo "    type nat hook postrouting priority srcnat; policy accept;"
-      printf '%s\n' "${snat_lines[@]}"
+      echo "    $snat_rule"
       echo "  }"
     fi
     echo "}"
@@ -355,9 +321,7 @@ validate_ruleset() {
 }
 
 apply_rules() {
-  local tmp
-  tmp="$(mktemp)" || die "mktemp 失败"
-  TMP="$tmp"
+  TMP="$(mktemp)" || die "mktemp 失败"
   trap 'rm -f "$TMP"' EXIT
 
   parse_conf
@@ -634,14 +598,15 @@ menu() {
     if table_loaded; then loaded="已加载"; else loaded="未加载"; fi
     clear 2>/dev/null || true
     echo "=============== nftables 端口放行 / 转发 ==============="
-    echo " 规则清单：$(rule_count) 条    源地址伪装：$(snat_state)    运行状态：$loaded    开机自启：$(boot_state)"
+    ST="$(snat_state)"
+    echo " 规则清单：$(rule_count) 条    源地址伪装：$ST    运行状态：$loaded    开机自启：$(boot_state)"
     hr
     echo "  1) 查看当前生效规则"
     echo "  2) 查看规则清单"
     echo "  3) 添加放行端口"
     echo "  4) 添加端口转发"
     echo "  5) 删除一条规则"
-    echo "  6) 切换源地址伪装（当前 $(snat_state)）"
+    echo "  6) 切换源地址伪装（当前 $ST）"
     echo "  7) 应用配置"
     echo "  8) 回滚（删除已加载的全部规则）"
     echo "  9) 直接编辑规则清单"
