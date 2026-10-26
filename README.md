@@ -18,7 +18,8 @@ sudo ./nft-portfwd.sh              # 交互式菜单（有终端时）
 sudo ./nft-portfwd.sh --apply      # 直接应用规则清单
 sudo ./nft-portfwd.sh --dry-run    # 只打印生成的 ruleset，不落地
 sudo ./nft-portfwd.sh --flush      # 回滚：删表 + 卸开机服务
-sudo ./nft-portfwd.sh --persist    # 应用 + 装 systemd 服务（开机自动恢复）
+sudo ./nft-portfwd.sh --persist    # 装/更新开机服务（默认行为，显式写无害）
+sudo ./nft-portfwd.sh --no-persist # 这次只改运行期，不碰开机服务
 sudo ./nft-portfwd.sh --unpersist  # 只卸开机服务，规则留在内存里
 sudo ./nft-portfwd.sh --snat       # 强制开启源地址伪装（覆盖清单里的 snat 指令）
 sudo ./nft-portfwd.sh --no-snat    # 强制关闭伪装
@@ -61,7 +62,7 @@ snat off                         # 可选指令，关闭源地址伪装（默认
 - **协议**：TCP / UDP 都支持，同端口号可分别配一条。
 - **加载前先自检**：`flush_table` 之前会先用 `nft -c` 校验一遍生成的 ruleset（校验时把表名换成临时名字，否则表已存在会报 `File exists`）。所以一份被 nft 拒绝的配置**不会先把线上规则清空再失败**——那等于自己把防火墙拆了。`--dry-run` 同样会跑这一步，菜单的「校验」因此能拦住非法地址之类的错误。
 - **空清单是合法状态**：所有规则删光后会生成一张只有空链的表，并打印一条警告。菜单因此可以删掉最后一条规则（`--flush` 则是连表带开机服务一起移除）。
-- **`--persist` 不接受临时伪装开关**：`--persist --no-snat` 这类组合会直接报错，因为开机服务读的是清单本身，命令行开关不会被保留——否则重启后伪装状态会悄悄反转。要改就改 `ports.conf` 里的 `snat on|off`。
+- **命令行伪装开关不会写进开机服务**：`--snat` / `--no-snat` 与清单里的 `snat` 不一致时，本次只改运行期，开机服务保持原样并打印警告——否则重启后伪装状态会悄悄反转。要长期生效就改 `ports.conf` 里的 `snat on|off`。
 - **地址族**：只做 IPv4 转发。目标写 IPv6 会直接报错退出（避免半套规则）。
 - **`ip_forward`**：有转发规则时自动 `sysctl -w net.ipv4.ip_forward=1`，只改运行期。
 - **`input` 链只管放行，policy 是 accept**：本工具不拦截任何流量。如果这台机上还有别的 base chain 在 `input` 上做 drop（Docker、ufw、Debian 默认 `nftables.conf` 都可能），那"放行"仍然由那张表说了算——本工具加的是 accept，救不回别处已经 drop 的包。要真正放行，得在管事的那个链里放行。
@@ -69,7 +70,7 @@ snat off                         # 可选指令，关闭源地址伪装（默认
 - **`counter`**：每条转发规则带命中计数，`nft list table inet portfwd` 能一眼区分「包没到」和「包到了但回程丢」。
 - **回程**：默认对落地目标做 `masquerade`。这不是可选项——"公网客户端 → 转发节点 → 公网落地目标"下如果关掉它，落地目标的回包会直接发给客户端，客户端因为源 IP:port 对不上自己的连接而丢弃，表现为连上但永远没响应（实测：DNAT 计数器涨了 1 个包，curl 超时）。只有落地目标的回程本来就经过本机（例如目标在本机后端 / 目标的默认网关就是本机）时才用 `--no-snat` 换取真实源 IP。
 - **forward 链**：policy accept，并放行 `ct status dnat` 与 `established,related`，在 forward 默认 drop 的主机上也能通。
-- **持久化**：默认不持久化。`--persist` 会装一个 systemd oneshot 服务 `nft-portfwd.service`，开机时执行 `--apply`，读的是同一份规则清单——所以之后改规则只要重新应用，不用重装服务。`--flush` 会把服务一起卸掉（回滚 = 彻底移除）。
+- **持久化是默认行为**：每次应用都会装/更新 systemd oneshot 服务 `nft-portfwd.service`（`ExecStart` 带 `--no-persist`，避免开机时重装自己），开机执行 `--apply`，读同一份规则清单——所以改完规则重新应用即可，不用重装服务。`--no-persist` 让这一次只改运行期；`--unpersist` 卸掉服务但保留规则；`--flush` 两者一起清。没有 systemd 的机器上会自动跳过并提示，不影响规则生效。
 
 ## 已知非目标
 

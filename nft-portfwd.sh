@@ -62,7 +62,7 @@ CONF="$SELF_DIR/ports.conf"
 # 运行模式与开关（参数解析阶段填充）
 MODE=""                # ""=待定  menu=菜单  apply=非交互应用
 DO_FLUSH=0
-DO_PERSIST=0
+DO_PERSIST=1           # 默认持久化：应用后自动装/更新开机服务，--no-persist 可关
 DO_UNPERSIST=0
 DRY_RUN=0
 CONF_SNAT="on"         # 来自规则清单里的 `snat on|off`
@@ -122,9 +122,13 @@ boot_state() {
 #   Wants=network-online.target  规则清单允许写域名，解析需要网络就绪
 #   RemainAfterExit=yes          oneshot 跑完否则显示 inactive，会误导人
 #   ExecStart 用 --apply         保证非交互，不会在开机时卡在菜单上
+#   并加 --no-persist            避免开机时又去重装/重启用自己
 
 install_unit() {
-  command -v systemctl >/dev/null 2>&1 || die "这台机器没有 systemd，无法安装开机服务"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "这台机器没有 systemd，跳过开机服务（规则已在运行期生效）"
+    return 0
+  fi
   # 路径里有空格时 systemd 会把 ExecStart 拆成多个参数；`%` 是 systemd 的说明符前缀，
   # 必须写成 `%%`。两处都要转义后再放进单元文件。
   local EXE="${SELF//%/%%}" CONFQ="${CONF//%/%%}"
@@ -137,7 +141,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart="$EXE" --apply --conf "$CONFQ"
+ExecStart="$EXE" --apply --no-persist --conf "$CONFQ"
 
 [Install]
 WantedBy=multi-user.target
@@ -388,12 +392,14 @@ apply_rules() {
   info "已加载 table $FAMILY $TABLE"
 
   if [ "$DO_PERSIST" -eq 1 ]; then
-    # 命令行的伪装开关只影响这一次运行，开机服务读的是清单本身。不一致就必须拦住，
-    # 否则重启后伪装状态会悄悄反转（表现就是"连上了但没响应"）。
+    # 命令行的伪装开关只影响这一次运行，开机服务读的是清单本身。两者不一致时不去动
+    # 服务，否则重启后伪装状态会悄悄反转（表现就是"连上了但没响应"）。
     if [ -n "$SNAT_FLAG" ] && [ "$SNAT_FLAG" != "$CONF_SNAT" ]; then
-      die "--persist 不会保留命令行 --snat/--no-snat；请改在 ports.conf 里写 snat on/off"
+      warn "命令行伪装开关与清单里的 snat 不一致：本次只改运行期，开机服务保持原样"
+      warn "要让开机也一致，请改 ports.conf 里的 snat on|off"
+    else
+      install_unit
     fi
-    install_unit
   fi
 
   echo "== 生效规则 =="
@@ -557,7 +563,8 @@ do_toggle_boot() {
   case "$st" in
     开)
       echo "当前：开机自动生效 = 开"
-      echo "开机时执行本脚本的 --apply，读的是同一份 $CONF。"
+      echo "开机时执行本脚本的 --apply --no-persist，读的是同一份 $CONF。"
+      echo "注意：持久化是默认行为，卸掉之后下次「应用配置」会再装回来。"
       read -rp "取消开机自动生效？[y/N] " a || return
       case "$a" in y|Y|yes|YES) "$SELF" --unpersist ;; *) return ;; esac
       ;;
@@ -671,8 +678,9 @@ usage() {
   sudo ./nft-portfwd.sh --apply         # 直接应用规则清单
   sudo ./nft-portfwd.sh --dry-run       # 只打印生成的 ruleset，不落地
   sudo ./nft-portfwd.sh --flush         # 回滚：删表 + 卸开机服务
-  sudo ./nft-portfwd.sh --persist       # 应用 + 装 systemd 服务（开机自动恢复）
-  sudo ./nft-portfwd.sh --unpersist     # 只卸开机服务，规则留在内存里
+  sudo ./nft-portfwd.sh --persist       # 应用 + 装开机服务（默认行为，显式写无害）
+  sudo ./nft-portfwd.sh --no-persist    # 这次只改运行期，不碰开机服务
+  sudo ./nft-portfwd.sh --unpersist     # 卸掉开机服务（规则留在内存里）
   sudo ./nft-portfwd.sh --snat          # 强制开启源地址伪装
   sudo ./nft-portfwd.sh --no-snat       # 强制关闭源地址伪装
   sudo ./nft-portfwd.sh --conf FILE     # 指定规则清单
@@ -687,6 +695,7 @@ while [ $# -gt 0 ]; do
     --apply)     MODE=apply ;;
     --flush)     MODE=apply; DO_FLUSH=1 ;;
     --persist)   MODE=apply; DO_PERSIST=1 ;;
+    --no-persist) MODE=apply; DO_PERSIST=0 ;;
     --unpersist) MODE=apply; DO_UNPERSIST=1 ;;
     --snat)      MODE="${MODE:-apply}"; SNAT_FLAG=on ;;
     --no-snat)   MODE="${MODE:-apply}"; SNAT_FLAG=off ;;
