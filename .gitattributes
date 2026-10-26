@@ -1,0 +1,6 @@
+# 脚本和配置都必须在 Linux 上按 LF 落盘：
+# CRLF 会让 shebang 变成 `#!/usr/bin/env bash\r`，脚本直接跑不起来。
+* text=auto eol=lf
+*.sh text eol=lf
+*.conf text eol=lf
+*.md text eol=lf
