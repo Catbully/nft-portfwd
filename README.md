@@ -30,35 +30,27 @@ sudo ./nft-portfwd.sh --conf FILE  # 指定规则清单
 
 幂等：重复执行会先删掉 `inet portfwd` 再重建，不会叠加规则。
 
-## 装成系统命令（可选）
+## 装成系统命令
 
-装到 `/opt/nft-portfwd/`，再加一个 shell 函数：**直接输入 `nft` 进菜单，带参数时仍是真正的 nft 命令**。
+一条命令装完，之后**直接输入 `nft` 就是菜单**，`nft list ruleset` 这类带参数的调用仍然是真正的 nft：
 
 ```bash
-sudo bash -c "mkdir -p /opt/nft-portfwd && cd /opt/nft-portfwd && curl -fsSLO https://raw.githubusercontent.com/Catbully/nft-portfwd/main/nft-portfwd.sh && curl -fsSLO https://raw.githubusercontent.com/Catbully/nft-portfwd/main/ports.conf && chmod +x nft-portfwd.sh"
-
-sudo tee /etc/profile.d/nft-menu.sh >/dev/null <<'EOF'
-# 直接输入 nft（无参数）打开端口放行/转发菜单；带参数时仍是真正的 nft 命令。
-nft() {
-  if [ $# -gt 0 ]; then
-    # type -P 只查 PATH、不认函数；PATH 里没有 /usr/sbin 时退回绝对路径
-    local real
-    real="$(type -P nft)" || real=/usr/sbin/nft
-    [ -x "$real" ] || real=/usr/sbin/nft
-    "$real" "$@"
-    return
-  fi
-  if [ ! -x /opt/nft-portfwd/nft-portfwd.sh ]; then
-    echo "未安装：见 https://github.com/Catbully/nft-portfwd" >&2
-    return 1
-  fi
-  if [ "$(id -u)" -eq 0 ]; then /opt/nft-portfwd/nft-portfwd.sh
-  else sudo /opt/nft-portfwd/nft-portfwd.sh; fi
-}
-EOF
+curl -fsSL https://raw.githubusercontent.com/Catbully/nft-portfwd/main/install.sh | sudo sh
 ```
 
-重开一个登录 shell 生效。用函数而不是覆盖 `/usr/sbin/nft`，是因为那会连带破坏 `nftables.service`、Docker 和本脚本自己的 `command -v nft`；函数只影响交互式 shell，`nft list ruleset` 之类带参数的调用照旧透传，脚本和 systemd 完全不受影响。
+它做三件事：脚本和 `ports.conf` 装到 `/opt/nft-portfwd/`；在 `/usr/local/bin/nft` 放一个包装；包装只在**无参数且在终端里**时进菜单（非 root 会自动 `sudo`），其余情况 `exec /usr/sbin/nft "$@"` 原样透传。
+
+为什么不是直接覆盖 `/usr/sbin/nft`：那会把 `nftables.service`、Docker 和本脚本自己的 `command -v nft` 一起劫持，脚本调 `nft list table` 时就会递归调用自己。包装靠"有参数就透传"避开这点——脚本、systemd、Docker 调 nft 时都带参数。
+
+卸载：
+
+```bash
+sudo /opt/nft-portfwd/nft-portfwd.sh --flush   # 清规则 + 卸开机服务
+sudo rm -f /usr/local/bin/nft && sudo rm -rf /opt/nft-portfwd
+```
+
+> bash 里如果之前已经跑过 `nft`，命令路径被缓存了，先 `hash -r` 或开新窗口。
+
 
 ## 菜单
 
